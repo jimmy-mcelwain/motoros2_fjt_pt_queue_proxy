@@ -60,11 +60,14 @@ class PointQueueProxy:
             self._logger.warning(f"Failed to load {CONVERGENCE_THRESHOLD_PARAM} parameter, " 
                                  f"defaulting to {CONVERGENCE_THRESHOLD_DEFAULT}")
 
-        # TODO: use remapping, not parameters
-        self._joint_states_topic: str = 'joint_states'
-        self._fjt_namespace: str = 'joint_trajectory_controller'
-        self._fjt_name: str = 'follow_joint_trajectory'
-        self._queue_pt_srv: str = 'queue_traj_point'
+        original_joint_states_topic: str = 'joint_states'
+        original_fjt_namespace: str = 'joint_trajectory_controller'
+        original_fjt_name: str = 'follow_joint_trajectory'
+        original_queue_pt_srv: str = 'queue_traj_point'
+        self._joint_states_topic = self._node.resolve_service_name(original_joint_states_topic)
+        self._fjt_namespace: str = self._node.resolve_service_name(original_fjt_namespace)
+        self._fjt_name: str = self._node.resolve_service_name(original_fjt_name)
+        self._queue_pt_srv: str = self._node.resolve_service_name(original_queue_pt_srv)
 
         # first the service client, as there's no point in continuing if the
         # server is not available
@@ -76,7 +79,7 @@ class PointQueueProxy:
 
         # TODO: see whether this needs its own callback group (if yes: can't
         # use simple_actions any more I believe)
-        fjt_server_ns = f'{self._fjt_namespace}/{self._fjt_name}'
+        fjt_server_ns = f'{self._fjt_namespace}{self._fjt_name}'
         self._logger.debug(f"Starting action server on '{fjt_server_ns}'")
         self._action_server = SimpleActionServer(
             self._node, FollowJointTrajectory,
