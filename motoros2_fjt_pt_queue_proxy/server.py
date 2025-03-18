@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import time
 import math
+import threading
 
 import rclpy
 
@@ -95,6 +96,7 @@ class PointQueueProxy:
 
         # stores last message we received from controller
         self._latest_jstates: JointState = None
+        self._latest_jstates_lock = threading.Lock()
 
         self._logger.info("PointQueueProxy: initialisation complete")
 
@@ -141,8 +143,8 @@ class PointQueueProxy:
 
 
     def _js_callback(self, msg):
-        # TODO: add locking (if needed)
-        self._latest_jstates = msg
+        with self._latest_jstates_lock:
+            self._latest_jstates = msg
 
         # NOTE: this does not work with upstream 'simple_actions', as it
         #       treats is_active as a method on the goal handle (it's a property).
@@ -180,13 +182,13 @@ class PointQueueProxy:
         self._logger.debug(f"received goal with {len(points)} traj pts")
 
         # checks
-        # TODO: add locking (if needed)
-        if not self._latest_jstates:
-            error_string = "waiting for (initial) feedback from controller"
-            self._logger.error(error_string)
-            return FollowJointTrajectory.Result(
-                error_code=FollowJointTrajectory.Result.INVALID_GOAL,
-                error_string=error_string)
+        with self._latest_jstates_lock:
+            if not self._latest_jstates:
+                error_string = "waiting for (initial) joint_states message from controller"
+                self._logger.error(error_string)
+                return FollowJointTrajectory.Result(
+                    error_code=FollowJointTrajectory.Result.INVALID_GOAL,
+                    error_string=error_string)
 
         if len(points) == 0:
             # TODO: implement motoman_driver/industrial_robot_client behaviour
@@ -265,27 +267,20 @@ class PointQueueProxy:
         # timeout, consider goal to have failed (regardless of whether the
         # pts were successfully queued).
         # Would also need to make sure to cancel any active motion
-
-        # TODO: add locking (if needed)
-        if not self._latest_jstates:
-            self._logger.warning("Can't track progress as no joint "
-                "states received, not waiting for execution before reporting "
-                "success")
-        else:
-            last_traj_dict = dict(zip(traj.joint_names, points[-1].positions))
-            rate = self._node.create_rate(30.0)
-            while rclpy.ok():
-                # TODO: add locking (if needed)
+        final_traj_dict = dict(zip(traj.joint_names, points[-1].positions))
+        rate = self._node.create_rate(30.0)
+        while rclpy.ok():
+            with self._latest_jstates_lock:
                 js_dict = dict(zip(
                     self._latest_jstates.name, self._latest_jstates.position))
-                dist = self._joint_distance(last_traj_dict, js_dict)
-                self._logger.debug(
-                    f"remaining distance: {dist:.4f}", throttle_duration_sec=1)
-                if dist <= self._convergence_threshold:
-                    self._logger.info(
-                        f"reached final traj pt (distance: {dist:.4f})")
-                    break
-                rate.sleep()
+            dist = self._joint_distance(final_traj_dict, js_dict)
+            self._logger.debug(
+                f"remaining distance: {dist:.4f}", throttle_duration_sec=1)
+            if dist <= self._convergence_threshold:
+                self._logger.info(
+                    f"reached final traj pt (distance: {dist:.4f})")
+                break
+            rate.sleep()
 
         # done executing the trajectory, so report the result
         # TODO: result could be negative if there was an error (RobotStatus),
