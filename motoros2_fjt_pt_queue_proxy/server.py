@@ -16,11 +16,7 @@ from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
 from motoros2_interfaces.msg import QueueResultEnum
 from motoros2_interfaces.srv import QueueTrajPoint
-# TODO: check RobotStatus to check whether e-stops or other error
-# conditions prevent the robot from actually execution the motion we've
-# queued. If there are errors, abort any active goal, reject new goals.
-# Similar to https://github.com/ros-industrial/industrial_core/pull/271
-#from industrial_msgs.msg import RobotStatus
+from industrial_msgs.msg import RobotStatus, TriState, RobotMode
 from sensor_msgs.msg import JointState
 
 
@@ -75,10 +71,12 @@ class PointQueueProxy:
                                  f"defaulting to {CONVERGENCE_THRESHOLD_DEFAULT}")
 
         original_joint_states_topic: str = 'joint_states'
+        original_robot_status_topic: str = 'robot_status'
         original_fjt_namespace: str = 'joint_trajectory_controller'
         original_fjt_name: str = 'follow_joint_trajectory'
         original_queue_pt_srv: str = 'queue_traj_point'
         self._joint_states_topic = self._node.resolve_service_name(original_joint_states_topic)
+        self._robot_status_topic = self._node.resolve_service_name(original_robot_status_topic)
         self._fjt_namespace: str = self._node.resolve_service_name(original_fjt_namespace)
         self._fjt_name: str = self._node.resolve_service_name(original_fjt_name)
         self._queue_pt_srv: str = self._node.resolve_service_name(original_queue_pt_srv)
@@ -109,10 +107,18 @@ class PointQueueProxy:
             JointState, self._joint_states_topic, self._js_callback,
             qos_profile=rclpy.qos.QoSPresetProfiles.get_from_short_key('sensor_data'),
             callback_group=rclpy.callback_groups.MutuallyExclusiveCallbackGroup())
+        
+        self._sub_rs = self._node.create_subscription(
+            RobotStatus, self._robot_status_topic, self._rs_callback,
+            qos_profile=rclpy.qos.QoSPresetProfiles.get_from_short_key('sensor_data'),
+            callback_group=rclpy.callback_groups.MutuallyExclusiveCallbackGroup())
 
         # stores last message we received from controller
         self._latest_jstates: JointState = None
         self._latest_jstates_lock = threading.Lock()
+
+        self._latest_robot_status: RobotStatus = None
+        self._latest_robot_status_lock = threading.Lock()
 
         self._logger.info("PointQueueProxy: initialisation complete")
 
@@ -135,7 +141,7 @@ class PointQueueProxy:
             self._goal_handle = goal_handle
         goal_handle.execute()
         
-            
+
     async def _queue_point(self, joint_names: list[str], pt: JointTrajectoryPoint, max_retries: int = 0):
         self._logger.debug(f"attempting to queue pt (max_retries: {max_retries})")
 
@@ -208,6 +214,28 @@ class PointQueueProxy:
         assert len(d0) == len(d1)
         return math.fsum([abs(val - d1[name]) for name, val in d0.items()])
 
+    def _rs_callback(self, msg):
+        with self._latest_robot_status_lock:
+            self._latest_robot_status = msg
+
+        with self._goal_lock:
+            if self._goal_handle is not None and self._goal_handle.is_active:
+                if msg.e_stopped.val == TriState.TRUE:
+                    self._logger.error("The E-Stop was activated. Aborting goal...")
+                    self._goal_handle.abort()
+                elif msg.in_error.val == TriState.TRUE:
+                    self._logger.error(f"The controller is in an error state. Rejecting goal...")
+                    self._goal_handle.abort()
+                elif msg.drives_powered.val == TriState.FALSE:
+                    self._logger.error("The servos are not powered on. Call the /start_point_queue_mode service. Rejecting goal...")
+                    self._goal_handle.abort()
+                elif msg.mode.val != RobotMode.AUTO:
+                    self._logger.error("Motion is not possible right now. Rejecting goal...")
+                    self._goal_handle.abort()
+                elif msg.motion_possible.val == TriState.FALSE:
+                    self._logger.error("Motion is no longer possible. Aborting goal...")
+                    self._goal_handle.abort()
+
 
     def fjt_goal_callback(self, goal):
         self._logger.debug('fjt callback: entry')
@@ -222,6 +250,26 @@ class PointQueueProxy:
             if not self._latest_jstates:
                 error_string = "waiting for (initial) joint_states message from controller"
                 self._logger.error(error_string)
+                return GoalResponse.REJECT
+        with self._latest_robot_status_lock:
+            if not self._latest_robot_status:
+                error_string = "waiting for (initial) robot_status message from controller"
+                self._logger.error(error_string)
+                return GoalResponse.REJECT
+            elif self._latest_robot_status.e_stopped.val == TriState.TRUE:
+                self._logger.error("The E-Stop is active. Rejecting goal...")
+                return GoalResponse.REJECT
+            elif self._latest_robot_status.in_error.val == TriState.TRUE:
+                self._logger.error(f"The controller is in an error state. Rejecting goal...")
+                return GoalResponse.REJECT
+            elif self._latest_robot_status.drives_powered.val == TriState.FALSE:
+                self._logger.error("The servos are not powered on. Call the /start_point_queue_mode service. Rejecting goal...")
+                return GoalResponse.REJECT
+            elif self._latest_robot_status.mode.val != RobotMode.AUTO:
+                self._logger.error("Motion is not possible right now. Rejecting goal...")
+                return GoalResponse.REJECT
+            elif self._latest_robot_status.motion_possible.val == TriState.FALSE:
+                self._logger.error("Motion is not longer possible right now. Rejecting goal...")
                 return GoalResponse.REJECT
             
         if len(points) == 0:
