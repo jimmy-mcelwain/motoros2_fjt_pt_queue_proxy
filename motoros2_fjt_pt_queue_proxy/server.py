@@ -87,13 +87,13 @@ class PointQueueProxy:
         self._queue_pt_client = self._node.create_client(
             QueueTrajPoint, self._queue_pt_srv, callback_group=self._cbg_svc)
         while not self._queue_pt_client.wait_for_service(timeout_sec=5.0):
-            self._logger.info('Waiting for queue_traj_point server ..')
+            self._logger.info(f'Waiting for queue_traj_point server... ({self._queue_pt_srv})')
 
-        fjt_server_ns = f'{self._fjt_namespace}{self._fjt_name}'
-        self._logger.debug(f"Starting action server on '{fjt_server_ns}'")
+        fjt_fully_qualified_name = f'{self._fjt_namespace}{self._fjt_name}'
+        self._logger.debug(f"Starting action server on '{fjt_fully_qualified_name}'")
         self._action_server = ActionServer(
             self._node, FollowJointTrajectory,
-            fjt_server_ns,
+            fjt_fully_qualified_name,
             goal_callback=self.fjt_goal_callback,
             cancel_callback=self.fjt_cancel_callback,
             execute_callback=self.fjt_execute_callback,
@@ -114,8 +114,8 @@ class PointQueueProxy:
             callback_group=rclpy.callback_groups.MutuallyExclusiveCallbackGroup())
 
         # stores last message we received from controller
-        self._latest_jstates: JointState = None
-        self._latest_jstates_lock = threading.Lock()
+        self._latest_joint_states: JointState = None
+        self._latest_joint_states_lock = threading.Lock()
 
         self._latest_robot_status: RobotStatus = None
         self._latest_robot_status_lock = threading.Lock()
@@ -187,8 +187,8 @@ class PointQueueProxy:
 
 
     def _js_callback(self, msg):
-        with self._latest_jstates_lock:
-            self._latest_jstates = msg
+        with self._latest_joint_states_lock:
+            self._latest_joint_states = msg
 
         with self._goal_lock:
             if self._goal_handle is None or not self._goal_handle.is_active:
@@ -246,8 +246,8 @@ class PointQueueProxy:
         self._logger.debug(f"received goal with {len(points)} traj pts")
 
         # checks
-        with self._latest_jstates_lock:
-            if not self._latest_jstates:
+        with self._latest_joint_states_lock:
+            if not self._latest_joint_states:
                 error_string = "waiting for (initial) joint_states message from controller"
                 self._logger.error(error_string)
                 return GoalResponse.REJECT
@@ -389,9 +389,9 @@ class PointQueueProxy:
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
                         error_string="Goal cancelled") 
-            with self._latest_jstates_lock:
+            with self._latest_joint_states_lock:
                 js_dict = dict(zip(
-                    self._latest_jstates.name, self._latest_jstates.position))
+                    self._latest_joint_states.name, self._latest_joint_states.position))
             dist = self._joint_distance(last_traj_dict, js_dict)
             self._logger.debug(
                 f"remaining distance: {dist:.4f}", throttle_duration_sec=1)
