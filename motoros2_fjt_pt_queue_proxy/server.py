@@ -7,8 +7,10 @@ import sys
 import time
 import math
 import threading
+import asyncio 
 
 import rclpy
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
 
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -21,14 +23,15 @@ from motoros2_interfaces.srv import QueueTrajPoint
 #from industrial_msgs.msg import RobotStatus
 from sensor_msgs.msg import JointState
 
-from simple_actions import SimpleActionServer
 
 MAX_RETRIES_PARAM = "max_retries"
 BUSY_WAIT_TIME_PARAM = "busy_wait_time"
+QUEUE_POINT_RESPONSE_WAIT_TIME_PARAM = "queue_point_response_wait_time"
 CONVERGENCE_THRESHOLD_PARAM = "convergence_threshold"
 
 MAX_RETRIES_DEFAULT = 20
 BUSY_WAIT_TIME_DEFAULT = 0.05
+QUEUE_POINT_RESPONSE_WAIT_TIME_DEFAULT = 0.1
 CONVERGENCE_THRESHOLD_DEFAULT = 0.01
 
 class PointQueueProxy:
@@ -37,9 +40,13 @@ class PointQueueProxy:
         self._logger = self._node.get_logger()
         self._logger.info("PointQueueProxy: initialising ..")
 
+        self._goal_handle = None
+        self._goal_lock = threading.Lock()
+
         # Declare ROS parameters
         self._node.declare_parameter(MAX_RETRIES_PARAM, MAX_RETRIES_DEFAULT)
         self._node.declare_parameter(BUSY_WAIT_TIME_PARAM, BUSY_WAIT_TIME_DEFAULT)
+        self._node.declare_parameter(QUEUE_POINT_RESPONSE_WAIT_TIME_PARAM, QUEUE_POINT_RESPONSE_WAIT_TIME_DEFAULT)
         self._node.declare_parameter(CONVERGENCE_THRESHOLD_PARAM, CONVERGENCE_THRESHOLD_DEFAULT)
 
         # maximum nr of retries per traj pt
@@ -54,6 +61,12 @@ class PointQueueProxy:
         except:
             self._logger.warning(f"Failed to load {BUSY_WAIT_TIME_PARAM} parameter, " 
                                  f"defaulting to {BUSY_WAIT_TIME_DEFAULT}")
+        # seconds: how long to wait for the point queue server to respond
+        try:
+            self._point_queue_response_wait_time = float(self._node.get_parameter(QUEUE_POINT_RESPONSE_WAIT_TIME_PARAM).value)
+        except:
+            self._logger.warning(f"Failed to load {QUEUE_POINT_RESPONSE_WAIT_TIME_PARAM} parameter, " 
+                                 f"defaulting to {QUEUE_POINT_RESPONSE_WAIT_TIME_DEFAULT}")
         # radians: total joint distance, not per-joint
         try:
             self._convergence_threshold = float(self._node.get_parameter(CONVERGENCE_THRESHOLD_PARAM).value)
@@ -78,14 +91,17 @@ class PointQueueProxy:
         while not self._queue_pt_client.wait_for_service(timeout_sec=5.0):
             self._logger.info('Waiting for queue_traj_point server ..')
 
-        # TODO: see whether this needs its own callback group (if yes: can't
-        # use simple_actions any more I believe)
         fjt_server_ns = f'{self._fjt_namespace}{self._fjt_name}'
         self._logger.debug(f"Starting action server on '{fjt_server_ns}'")
-        self._action_server = SimpleActionServer(
+        self._action_server = ActionServer(
             self._node, FollowJointTrajectory,
             fjt_server_ns,
-            self.fjt_goal_callback)
+            goal_callback=self.fjt_goal_callback,
+            cancel_callback=self.fjt_cancel_callback,
+            execute_callback=self.fjt_execute_callback,
+            handle_accepted_callback=self.fjt_handle_accepted_callback,
+            callback_group=rclpy.callback_groups.ReentrantCallbackGroup()
+            )
 
         # MotoROS2 might be using 'sensor_data' profile or 'default'.
         # Use 'sensor_data' here, as it should be compatible with both
@@ -101,7 +117,26 @@ class PointQueueProxy:
         self._logger.info("PointQueueProxy: initialisation complete")
 
 
-    def _queue_point(self, joint_names: list[str], pt: JointTrajectoryPoint, max_retries: int = 0):
+    def destroy(self):
+        self._action_server.destroy()
+        super().destroy_node()
+
+
+    def fjt_cancel_callback(self, goal):
+        self._logger.warning("Received cancel request")
+        return CancelResponse.ACCEPT
+    
+
+    def fjt_handle_accepted_callback(self, goal_handle):
+        with self._goal_lock:
+            if self._goal_handle is not None and self._goal_handle.is_active:
+                self._logger.warning("Aborting previous goal...")
+                self._goal_handle.abort()
+            self._goal_handle = goal_handle
+        goal_handle.execute()
+        
+            
+    async def _queue_point(self, joint_names: list[str], pt: JointTrajectoryPoint, max_retries: int = 0):
         self._logger.debug(f"attempting to queue pt (max_retries: {max_retries})")
 
         attempts: int = 0
@@ -112,11 +147,14 @@ class PointQueueProxy:
         while rclpy.ok() and ((attempts < max_retries) if max_retries else True):
             self._logger.debug(f"queuing pt (attempt: {attempts})")
 
-            # use a sync request to keep control flow 'simple'.
-            # This should work as we use different cb grps and an mt executor.
-            # TODO: the synchronous call does not support setting a timeout,
-            # so if the server dies/disappears, this hangs forever
-            response = self._queue_pt_client.call(req)
+            # Right now the calling function aborts immediately if the action server does not respond in time
+            request_future = self._queue_pt_client.call_async(req)
+            try:
+                response = await asyncio.wait_for(request_future, self._point_queue_response_wait_time)
+            except asyncio.TimeoutError:
+                self._logger.error("The queue point server did not respond in time")
+                result_code = -1
+                break
 
             # only if we receive a BUSY response we try again. Anything else
             # is something only the caller can handle (including OK)
@@ -146,11 +184,9 @@ class PointQueueProxy:
         with self._latest_jstates_lock:
             self._latest_jstates = msg
 
-        # NOTE: this does not work with upstream 'simple_actions', as it
-        #       treats is_active as a method on the goal handle (it's a property).
-        #       See https://github.com/DLu/simple_actions/issues/1
-        if not self._action_server.is_active() or not self._action_server.is_executing():
-            return
+        with self._goal_lock:
+            if self._goal_handle is None or not self._goal_handle.is_active:
+                return
 
         fmsg = FollowJointTrajectory.Feedback()
 
@@ -163,7 +199,8 @@ class PointQueueProxy:
         fmsg.actual.velocities = msg.velocity
         fmsg.actual.effort = msg.effort
 
-        self._action_server.publish_feedback(fmsg)
+        with self._goal_lock:
+            self._goal_handle.publish_feedback(fmsg)
 
 
     def _joint_distance(self, d0: dict[str, float], d1: dict[str, float]) -> float:
@@ -177,7 +214,6 @@ class PointQueueProxy:
 
         traj = goal.trajectory
         points = traj.points
-        points_sent: int = 0
 
         self._logger.debug(f"received goal with {len(points)} traj pts")
 
@@ -186,26 +222,20 @@ class PointQueueProxy:
             if not self._latest_jstates:
                 error_string = "waiting for (initial) joint_states message from controller"
                 self._logger.error(error_string)
-                return FollowJointTrajectory.Result(
-                    error_code=FollowJointTrajectory.Result.INVALID_GOAL,
-                    error_string=error_string)
-
+                return GoalResponse.REJECT
+            
         if len(points) == 0:
             # TODO: implement motoman_driver/industrial_robot_client behaviour
             # (ie: cancel any executing trajectory)
             error_string = "not executing an empty trajectory"
             self._logger.warning(error_string)
-            return FollowJointTrajectory.Result(
-                error_code=FollowJointTrajectory.Result.SUCCESSFUL,
-                error_string=error_string)
+            return GoalResponse.REJECT
 
         if len(traj.joint_names) == 0:
             error_string = "no joint names, can't continue"
             self._logger.error(error_string)
-            return FollowJointTrajectory.Result(
-                error_code=FollowJointTrajectory.Result.INVALID_JOINTS,
-                error_string=error_string)
-
+            return GoalResponse.REJECT
+        
         # arbitrary, but there aren't (m)any Motoman robots with less than
         # four joints, especially not ones supported by MotoROS2
         if len(traj.joint_names) < 4:
@@ -215,6 +245,15 @@ class PointQueueProxy:
         # correspond to the MotoROS2 configured joint names, but we have no
         # way of accessing MotoROS2's configuration at the moment.
         # (could potentially sample 'joint_states' topic and use those names)
+        return GoalResponse.ACCEPT
+
+    async def fjt_execute_callback(self, goal_handle):
+
+        self._logger.debug("Executing goal...")
+
+        traj = goal_handle.request.trajectory
+        points = traj.points
+        points_sent: int = 0
 
         # we're going to process the goal, so relay JointStates published
         # by MotoROS2 as FollowJointTrajectory_Feedback
@@ -225,12 +264,27 @@ class PointQueueProxy:
         while rclpy.ok() and (points_sent < len(points)):
             self._logger.debug(f"attempting to queue pt {points_sent}")
 
-            # TODO: check whether goal has been cancelled in the meantime
             # TODO: check whether js watchdog has bitten and cancel/abort goal ourselves
 
+            with self._goal_lock:
+                if not goal_handle.is_active:
+                    self._logger.debug("Goal aborted")
+                    return FollowJointTrajectory.Result(
+                        # TODO: use MotoROS2 error reporting method
+                        error_code=FollowJointTrajectory.Result.INVALID_GOAL,
+                        error_string="Goal aborted") 
+                elif goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    self._logger.debug("Goal cancelled")
+                    return FollowJointTrajectory.Result(
+                        # TODO: use MotoROS2 error reporting method
+                        error_code=FollowJointTrajectory.Result.INVALID_GOAL,
+                        error_string="Goal cancelled") 
+
             pt = points[points_sent]
-            result = self._queue_point(
+            result = asyncio.run(self._queue_point(
                 joint_names=traj.joint_names, pt=pt, max_retries=self._max_retries)
+            )
 
             # if this is an error, or still BUSY, something is wrong. Abort
             # the goal and report error
@@ -238,6 +292,9 @@ class PointQueueProxy:
                 error_string = (f"failed to queue pt {points_sent}, aborting goal "
                                 f"(queue server reported: {result})")
                 self._logger.error(error_string)
+                with self._goal_lock:
+                    if self._goal_handle is not None and self._goal_handle.is_active:
+                        goal_handle.abort()
                 return FollowJointTrajectory.Result(
                     # TODO: use MotoROS2 error reporting method
                     error_code=FollowJointTrajectory.Result.INVALID_GOAL,
@@ -267,13 +324,27 @@ class PointQueueProxy:
         # timeout, consider goal to have failed (regardless of whether the
         # pts were successfully queued).
         # Would also need to make sure to cancel any active motion
-        final_traj_dict = dict(zip(traj.joint_names, points[-1].positions))
+        last_traj_dict = dict(zip(traj.joint_names, points[-1].positions))
         rate = self._node.create_rate(30.0)
         while rclpy.ok():
+            with self._goal_lock:
+                if not goal_handle.is_active:
+                    self._logger.debug("Goal aborted")
+                    return FollowJointTrajectory.Result(
+                        # TODO: use MotoROS2 error reporting method
+                        error_code=FollowJointTrajectory.Result.INVALID_GOAL,
+                        error_string="Goal aborted") 
+                elif goal_handle.is_cancel_requested:
+                    goal_handle.canceled()
+                    self._logger.debug("Goal cancelled")
+                    return FollowJointTrajectory.Result(
+                        # TODO: use MotoROS2 error reporting method
+                        error_code=FollowJointTrajectory.Result.INVALID_GOAL,
+                        error_string="Goal cancelled") 
             with self._latest_jstates_lock:
                 js_dict = dict(zip(
                     self._latest_jstates.name, self._latest_jstates.position))
-            dist = self._joint_distance(final_traj_dict, js_dict)
+            dist = self._joint_distance(last_traj_dict, js_dict)
             self._logger.debug(
                 f"remaining distance: {dist:.4f}", throttle_duration_sec=1)
             if dist <= self._convergence_threshold:
@@ -285,6 +356,14 @@ class PointQueueProxy:
         # done executing the trajectory, so report the result
         # TODO: result could be negative if there was an error (RobotStatus),
         # it takes too long to reach the last traj pt, etc.
+        with self._goal_lock:
+            if not goal_handle.is_active:
+                self.get_logger().info('Goal was aborted')
+                return FollowJointTrajectory.Result(
+                        # TODO: use MotoROS2 error reporting method
+                        error_code=FollowJointTrajectory.Result.INVALID_GOAL,
+                        error_string="Goal cancelled") 
+            goal_handle.succeed()
         result = FollowJointTrajectory.Result(
             error_code=FollowJointTrajectory.Result.SUCCESSFUL,
             error_string="")

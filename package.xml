@@ -14,7 +14,6 @@
   <exec_depend>motoros2_interfaces</exec_depend>
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
-  <exec_depend version_gte="0.2.2">simple_actions</exec_depend>
   <exec_depend>trajectory_msgs</exec_depend>
 
   <export>
