@@ -101,7 +101,7 @@ class PointQueueProxy:
             self._logger.info(f'Waiting for queue_traj_point server... ({self._queue_pt_srv})')
 
         fjt_fully_qualified_name = f'{self._fjt_namespace}{self._fjt_name}'
-        self._logger.debug(f"Starting action server on '{fjt_fully_qualified_name}'")
+        self._logger.info(f"Starting action server on '{fjt_fully_qualified_name}'")
         self._action_server = ActionServer(
             self._node, FollowJointTrajectory,
             fjt_fully_qualified_name,
@@ -147,7 +147,7 @@ class PointQueueProxy:
     def fjt_handle_accepted_callback(self, goal_handle):
         with self._goal_lock:
             if self._goal_handle is not None and self._goal_handle.is_active:
-                self._logger.warning("Aborting previous goal...")
+                self._logger.warning("Aborting previous goal")
                 self._goal_handle.abort()
             self._goal_handle = goal_handle
         goal_handle.execute()
@@ -189,7 +189,7 @@ class PointQueueProxy:
                 break
 
             # anything else is an error, so report
-            self._logger.warning(
+            self._logger.error(
                 f"queue server returned error: '{response.message}' ({result_code})")
             break
 
@@ -232,19 +232,19 @@ class PointQueueProxy:
         with self._goal_lock:
             if self._goal_handle is not None and self._goal_handle.is_active:
                 if msg.e_stopped.val == TriState.TRUE:
-                    self._logger.error("The E-Stop was activated. Aborting goal...")
+                    self._logger.error("The E-Stop was activated. Aborting goal")
                     self._goal_handle.abort()
                 elif msg.in_error.val == TriState.TRUE:
-                    self._logger.error(f"The controller is in an error state. Rejecting goal...")
+                    self._logger.error(f"The controller is in an error state. Aborting goal")
                     self._goal_handle.abort()
                 elif msg.drives_powered.val == TriState.FALSE:
-                    self._logger.error("The servos are not powered on. Call the /start_point_queue_mode service. Rejecting goal...")
+                    self._logger.error("The servos are not powered on. Call the /start_point_queue_mode service. Aborting goal")
                     self._goal_handle.abort()
                 elif msg.mode.val != RobotMode.AUTO:
-                    self._logger.error("Motion is not possible right now. Rejecting goal...")
+                    self._logger.error("The pendant is in teach mode. Change to remote mode. Aborting goal")
                     self._goal_handle.abort()
                 elif msg.motion_possible.val == TriState.FALSE:
-                    self._logger.error("Motion is no longer possible. Aborting goal...")
+                    self._logger.error("Motion is no longer possible. Aborting goal")
                     self._goal_handle.abort()
 
 
@@ -254,7 +254,7 @@ class PointQueueProxy:
         traj = goal.trajectory
         points = traj.points
 
-        self._logger.debug(f"received goal with {len(points)} traj pts")
+        self._logger.info(f"received goal with {len(points)} traj pts")
 
         # checks
         with self._latest_joint_states_lock:
@@ -268,26 +268,26 @@ class PointQueueProxy:
                 self._logger.error(error_string)
                 return GoalResponse.REJECT
             elif self._latest_robot_status.e_stopped.val == TriState.TRUE:
-                self._logger.error("The E-Stop is active. Rejecting goal...")
+                self._logger.error("The E-Stop is active. Rejecting goal")
                 return GoalResponse.REJECT
             elif self._latest_robot_status.in_error.val == TriState.TRUE:
-                self._logger.error(f"The controller is in an error state. Rejecting goal...")
+                self._logger.error(f"The controller is in an error state. Rejecting goal")
                 return GoalResponse.REJECT
             elif self._latest_robot_status.drives_powered.val == TriState.FALSE:
-                self._logger.error("The servos are not powered on. Call the /start_point_queue_mode service. Rejecting goal...")
+                self._logger.error("The servos are not powered on. Call the /start_point_queue_mode service. Rejecting goal")
                 return GoalResponse.REJECT
             elif self._latest_robot_status.mode.val != RobotMode.AUTO:
-                self._logger.error("Motion is not possible right now. Rejecting goal...")
+                self._logger.error("The pendant is in teach mode. Change to remote mode. Rejecting goal")
                 return GoalResponse.REJECT
             elif self._latest_robot_status.motion_possible.val == TriState.FALSE:
-                self._logger.error("Motion is not longer possible right now. Rejecting goal...")
+                self._logger.error("Motion is not longer possible right now. Rejecting goal")
                 return GoalResponse.REJECT
             
         if len(points) == 0:
             # TODO: implement motoman_driver/industrial_robot_client behaviour
             # (ie: cancel any executing trajectory)
             error_string = "not executing an empty trajectory"
-            self._logger.warning(error_string)
+            self._logger.error(error_string)
             return GoalResponse.REJECT
 
         if len(traj.joint_names) == 0:
@@ -304,11 +304,12 @@ class PointQueueProxy:
         # correspond to the MotoROS2 configured joint names, but we have no
         # way of accessing MotoROS2's configuration at the moment.
         # (could potentially sample 'joint_states' topic and use those names)
+        self._logger.info("Accepting goal")
         return GoalResponse.ACCEPT
 
     async def fjt_execute_callback(self, goal_handle):
 
-        self._logger.debug("Executing goal...")
+        self._logger.info("Executing goal")
 
         traj = goal_handle.request.trajectory
         points = traj.points
@@ -341,14 +342,14 @@ class PointQueueProxy:
 
             with self._goal_lock:
                 if not goal_handle.is_active:
-                    self._logger.debug("Goal aborted")
+                    self._logger.error("The goal is no longer active. No longer queueing points")
                     return FollowJointTrajectory.Result(
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
                         error_string="Goal aborted") 
                 elif goal_handle.is_cancel_requested:
                     goal_handle.canceled()
-                    self._logger.debug("Goal cancelled")
+                    self._logger.error("The goal was cancelled. No longer queueing points")
                     return FollowJointTrajectory.Result(
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
@@ -406,14 +407,14 @@ class PointQueueProxy:
         while rclpy.ok():
             with self._goal_lock:
                 if not goal_handle.is_active:
-                    self._logger.debug("Goal aborted")
+                    self._logger.error("The goal is no longer active. No longer waiting for convergence")
                     return FollowJointTrajectory.Result(
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
                         error_string="Goal aborted") 
                 elif goal_handle.is_cancel_requested:
                     goal_handle.canceled()
-                    self._logger.debug("Goal cancelled")
+                    self._logger.error("The goal was cancelled. No longer waiting for convergence")
                     return FollowJointTrajectory.Result(
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
@@ -438,16 +439,13 @@ class PointQueueProxy:
                 break
             rate.sleep()
 
-        # done executing the trajectory, so report the result
-        # TODO: result could be negative if there was an error (RobotStatus),
-        # it takes too long to reach the last traj pt, etc.
         with self._goal_lock:
             if not goal_handle.is_active:
-                self.get_logger().info('Goal was aborted')
+                self._logger().error('The goal is no longer active. Something went wrong after convergence')
                 return FollowJointTrajectory.Result(
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
-                        error_string="Goal cancelled") 
+                        error_string="Goal aborted") 
             goal_handle.succeed()
         result = FollowJointTrajectory.Result(
             error_code=FollowJointTrajectory.Result.SUCCESSFUL,
