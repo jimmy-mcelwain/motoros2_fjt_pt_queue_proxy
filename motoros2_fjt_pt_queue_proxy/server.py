@@ -11,6 +11,8 @@ import asyncio
 
 import rclpy
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.duration import Duration
+from rclpy.time import Time
 
 from control_msgs.action import FollowJointTrajectory
 from trajectory_msgs.msg import JointTrajectoryPoint
@@ -24,11 +26,13 @@ MAX_RETRIES_PARAM = "max_retries"
 BUSY_WAIT_TIME_PARAM = "busy_wait_time"
 QUEUE_POINT_RESPONSE_WAIT_TIME_PARAM = "queue_point_response_wait_time"
 CONVERGENCE_THRESHOLD_PARAM = "convergence_threshold"
+ABORT_ON_TIMEOUT_PARAM = "abort_on_timeout"
 
 MAX_RETRIES_DEFAULT = 20
 BUSY_WAIT_TIME_DEFAULT = 0.05
 QUEUE_POINT_RESPONSE_WAIT_TIME_DEFAULT = 0.1
 CONVERGENCE_THRESHOLD_DEFAULT = 0.01
+ABORT_ON_TIMEOUT_DEFAULT = True
 
 class PointQueueProxy:
     def __init__(self, node):
@@ -44,6 +48,7 @@ class PointQueueProxy:
         self._node.declare_parameter(BUSY_WAIT_TIME_PARAM, BUSY_WAIT_TIME_DEFAULT)
         self._node.declare_parameter(QUEUE_POINT_RESPONSE_WAIT_TIME_PARAM, QUEUE_POINT_RESPONSE_WAIT_TIME_DEFAULT)
         self._node.declare_parameter(CONVERGENCE_THRESHOLD_PARAM, CONVERGENCE_THRESHOLD_DEFAULT)
+        self._node.declare_parameter(ABORT_ON_TIMEOUT_PARAM, ABORT_ON_TIMEOUT_DEFAULT)
 
         # maximum nr of retries per traj pt
         try:
@@ -69,6 +74,12 @@ class PointQueueProxy:
         except:
             self._logger.warning(f"Failed to load {CONVERGENCE_THRESHOLD_PARAM} parameter, " 
                                  f"defaulting to {CONVERGENCE_THRESHOLD_DEFAULT}")
+        # true/false: whether timeout is enforced
+        try:
+            self._abort_on_timeout = bool(self._node.get_parameter(ABORT_ON_TIMEOUT_PARAM).value)
+        except:
+            self._logger.warning(f"Failed to load {ABORT_ON_TIMEOUT_PARAM} parameter, " 
+                                 f"defaulting to {ABORT_ON_TIMEOUT_DEFAULT}")
 
         original_joint_states_topic: str = 'joint_states'
         original_robot_status_topic: str = 'robot_status'
@@ -303,6 +314,20 @@ class PointQueueProxy:
         points = traj.points
         points_sent: int = 0
 
+        last_traj_point = traj.points[-1]
+        fjt_requested_duration_msg = last_traj_point.time_from_start
+        fjt_requested_duration = Duration.from_msg(fjt_requested_duration_msg)
+        goal_time_tolerance_msg = goal_handle.request.goal_time_tolerance
+        goal_time_tolerance = Duration.from_msg(goal_time_tolerance_msg)
+        
+        start_time = Time.from_msg(traj.header.stamp)
+        if(start_time.nanoseconds == 0):
+            start_time = self._node._clock.now()
+
+        # This order of operations is needed because for some reason, durations can be added to times, but not to each other
+        # This is fixed in rolling, but is the case in jazzy and before.
+        deadline = (start_time + fjt_requested_duration) + goal_time_tolerance
+
         # we're going to process the goal, so relay JointStates published
         # by MotoROS2 as FollowJointTrajectory_Feedback
 
@@ -328,6 +353,14 @@ class PointQueueProxy:
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
                         error_string="Goal cancelled") 
+                elif self._abort_on_timeout and self._node._clock.now() > deadline:
+                    goal_handle.abort()
+                    sec, nsec = deadline.seconds_nanoseconds()
+                    self._logger.error(f"Aborting goal: Timeout reached before sending all points -- deadline: {sec}.{nsec}")
+                    return FollowJointTrajectory.Result(
+                            # TODO: use MotoROS2 error reporting method
+                            error_code=FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED,
+                            error_string="Goal aborted") 
 
             pt = points[points_sent]
             result = asyncio.run(self._queue_point(
@@ -368,10 +401,6 @@ class PointQueueProxy:
             "waiting for robot to reach final traj pt "
             f"(threshold: {self._convergence_threshold} rad)")
 
-        # TODO: add a timeout. If JointStates haven't converged within the
-        # timeout, consider goal to have failed (regardless of whether the
-        # pts were successfully queued).
-        # Would also need to make sure to cancel any active motion
         last_traj_dict = dict(zip(traj.joint_names, points[-1].positions))
         rate = self._node.create_rate(30.0)
         while rclpy.ok():
@@ -389,6 +418,14 @@ class PointQueueProxy:
                         # TODO: use MotoROS2 error reporting method
                         error_code=FollowJointTrajectory.Result.INVALID_GOAL,
                         error_string="Goal cancelled") 
+                elif self._abort_on_timeout and self._node._clock.now() > deadline:
+                    goal_handle.abort()
+                    sec, nsec = deadline.seconds_nanoseconds()
+                    self._logger.error(f"Aborting goal: Timeout reached before convergence -- deadline: {sec}.{nsec}")
+                    return FollowJointTrajectory.Result(
+                            # TODO: use MotoROS2 error reporting method
+                            error_code=FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED,
+                            error_string="Goal aborted") 
             with self._latest_joint_states_lock:
                 js_dict = dict(zip(
                     self._latest_joint_states.name, self._latest_joint_states.position))
