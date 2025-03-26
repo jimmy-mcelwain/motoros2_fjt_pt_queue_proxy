@@ -284,9 +284,10 @@ class PointQueueProxy:
                 return GoalResponse.REJECT
             
         if len(points) == 0:
-            # TODO: implement motoman_driver/industrial_robot_client behaviour
-            # (ie: cancel any executing trajectory)
-            error_string = "not executing an empty trajectory"
+            error_string = "Empty trajectory"
+            with self._goal_lock:
+                if self._goal_handle is not None and self._goal_handle.is_active:
+                    self._goal_handle.abort()
             self._logger.error(error_string)
             return GoalResponse.REJECT
 
